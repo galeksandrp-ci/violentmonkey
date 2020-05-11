@@ -6,7 +6,11 @@ function delay(time) {
   return new Promise(resolve => setTimeout(resolve, time));
 }
 
-function transifexRequest(url, method = 'GET') {
+function transifexRequest(url, {
+  method = 'GET',
+  responseType = 'json',
+  data = null,
+} = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn('curl', [
       '-sSL',
@@ -14,6 +18,9 @@ function transifexRequest(url, method = 'GET') {
       `api:${process.env.TRANSIFEX_TOKEN}`,
       '-X',
       method,
+      '-H',
+      'Content-Type: application/json',
+      ...data == null ? [] : ['-d', JSON.stringify(data)],
       `https://www.transifex.com${url}`,
     ], { stdio: ['ignore', 'pipe', 'inherit'] });
     const stdoutBuffer = [];
@@ -23,15 +30,19 @@ function transifexRequest(url, method = 'GET') {
     child.on('exit', (code) => {
       if (code) {
         reject(code);
-      } else {
-        const stdout = Buffer.concat(stdoutBuffer).toString('utf8');
+        return;
+      }
+      let result = Buffer.concat(stdoutBuffer).toString('utf8');
+      if (responseType === 'json') {
         try {
-          resolve(JSON.parse(stdout));
+          result = JSON.parse(result);
         } catch (err) {
-          console.error('stdout: ' + stdout);
-          throw err;
+          console.error('stdout: ' + result);
+          reject(err);
+          return;
         }
       }
+      resolve(result);
     });
   });
 }
@@ -45,20 +56,37 @@ async function loadRemote(lang) {
   // Reference: https://docs.transifex.com/api/translations#downloading-and-uploading-translations
   // Use translated messages since we don't have enough reviewers
   const result = await transifexRequest(`/api/2/project/violentmonkey-nex/resource/messagesjson/translation/${lang}/?mode=onlytranslated`);
-  const reviewed = JSON.parse(result.content);
-  return reviewed;
+  const remote = JSON.parse(result.content);
+  return remote;
 }
 
 async function extract(lang) {
-  const reviewed = await loadRemote(lang);
+  const remote = await loadRemote(lang);
   const fullPath = `src/_locales/${lang}/messages.yml`;
-  const existed = yaml.safeLoad(await fs.readFile(fullPath, 'utf8'));
-  Object.entries(existed)
+  const local = yaml.safeLoad(await fs.readFile(fullPath, 'utf8'));
+  const remoteUpdate = {};
+  Object.entries(local)
   .forEach(([key, value]) => {
-    const reviewedMessage = reviewed[key] && reviewed[key].message;
-    if (reviewedMessage) value.message = reviewedMessage;
+    const remoteMessage = remote[key] && remote[key].message;
+    if (remoteMessage) value.message = remoteMessage;
+    else if (value.touched !== false && value.message) remoteUpdate[key] = value;
   });
-  await fs.writeFile(fullPath, yaml.safeDump(existed), 'utf8');
+  await fs.writeFile(fullPath, yaml.safeDump(local), 'utf8');
+  if (Object.keys(remoteUpdate).length) {
+    const strings = await transifexRequest(`/api/2/project/violentmonkey-nex/resource/messagesjson/translation/${lang}/strings/`);
+    const updates = strings.filter(({ key, reviewed }) => !reviewed && remoteUpdate[key])
+      .map(({ key, string_hash }) => ({
+        source_entity_hash: string_hash,
+        translation: remoteUpdate[key].message,
+      }));
+    process.stdout.write(`\n  Uploading translations for ${lang}:\n  ${JSON.stringify(updates)}\n`);
+    await transifexRequest(`/api/2/project/violentmonkey-nex/resource/messagesjson/translation/${lang}/strings/`, {
+      method: 'PUT',
+      responseType: 'text',
+      data: updates,
+    });
+    process.stdout.write('  finished\n');
+  }
 }
 
 async function main() {
@@ -81,6 +109,7 @@ async function main() {
       await extract(code);
     } catch (err) {
       process.stderr.write(`\nError pulling ${code}\n`)
+      console.error(err);
     }
     finished += 1;
     showProgress();
