@@ -20,9 +20,13 @@ function transifexRequest(url, {
       method,
       '-H',
       'Content-Type: application/json',
-      ...data == null ? [] : ['-d', JSON.stringify(data)],
+      ...data == null ? [] : ['-d', '@-'],
       `https://www.transifex.com${url}`,
-    ], { stdio: ['ignore', 'pipe', 'inherit'] });
+    ], { stdio: ['pipe', 'pipe', 'inherit'] });
+    if (data != null) {
+      child.stdin.write(JSON.stringify(data));
+      child.stdin.end();
+    }
     const stdoutBuffer = [];
     child.stdout.on('data', chunk => {
       stdoutBuffer.push(chunk);
